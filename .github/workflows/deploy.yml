@@ -1,0 +1,99 @@
+# Deploie template.yaml avec AWS SAM.
+#
+#   - push sur main, ou lancement manuel : pile principale <STACK_NAME> ;
+#   - pull request : pile de test <STACK_NAME>-pr<numero>, supprimee a la fermeture
+#     de la pull request par cleanup-pr.yml.
+#
+# Secrets et variables sont ceux de l'environnement GitHub "prod", pas du depot.
+#
+# Secrets :   AWS_DEPLOY_ROLE_ARN  role cree par template-role.yaml (sortie DeployRoleArn)
+#             SAM_ASSETS_BUCKET    bucket S3 existant ou le template est televerse
+# Variables : AWS_REGION           region des piles
+#             STACK_NAME           nom de la pile principale
+#
+# Journaux publics : le numero de compte AWS et le nom de la zone DNS sont masques
+# (affiches "***") dans tous les journaux du job, des que les identifiants AWS sont
+# obtenus. Le nom du bucket est un secret pour la meme raison.
+#
+# Variable optionnelle :
+#             REGISTRY_SUBDOMAIN   etiquette DNS du registre dans la zone exportee par
+#                                  template-account.yaml
+#
+# Nom du registre, <zone> etant la zone exportee par template-account.yaml :
+#   REGISTRY_SUBDOMAIN   pile principale        pile de la pull request 12
+#   (non definie)        <zone>                 pr12.<zone>
+#   docker               docker.<zone>          docker-pr12.<zone>
+#
+# Le compte GitHub autorise a pousser des images (parametres GitHubOwner et
+# GitHubOwnerId de la pile) est le proprietaire de ce depot.
+name: Deploiement de la pile AWS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - template.yaml
+      - .github/workflows/deploy.yml
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - template.yaml
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# Meme groupe que cleanup-pr.yml : la suppression d'une pile de pull request attend
+# la fin d'un deploiement en cours.
+concurrency:
+  group: stack-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Les pull requests venant d'un fork n'ont pas acces au secret : pas de deploiement.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Fournit le secret et les variables, et fixe le sujet du jeton OIDC presente a
+    # AWS : repo:<compte>/<depot>:environment:prod, pour main comme pour une pull request.
+    environment: prod
+    env:
+      SAM_CLI_TELEMETRY: '0'
+      SAM_ASSETS_BUCKET: ${{ secrets.SAM_ASSETS_BUCKET }}
+      STACK_NAME: ${{ github.event_name == 'pull_request' && format('{0}-pr{1}', vars.STACK_NAME, github.event.pull_request.number) || vars.STACK_NAME }}
+      # Un seul modele de creation de depots ECR par prefixe et par compte : chaque
+      # pile de pull request a donc son propre prefixe.
+      REPOSITORY_PREFIX: ${{ github.event_name == 'pull_request' && format('gh-pr{0}', github.event.pull_request.number) || 'gh' }}
+      SUBDOMAIN: ${{ github.event_name == 'pull_request' && (vars.REGISTRY_SUBDOMAIN && format('{0}-pr{1}', vars.REGISTRY_SUBDOMAIN, github.event.pull_request.number) || format('pr{0}', github.event.pull_request.number)) || vars.REGISTRY_SUBDOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      # Doit rester juste apres l'obtention des identifiants : un masque ne s'applique
+      # qu'aux lignes ecrites apres lui. La zone masquee couvre aussi le nom du registre.
+      - name: Masquer le compte AWS et le domaine dans les journaux
+        run: ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text) && ZONE_NAME=$(aws cloudformation list-exports --query "Exports[?Name=='DockerRegistry-ZoneName'].Value" --output text) && echo "::add-mask::${ACCOUNT_ID:?compte AWS introuvable}" && echo "::add-mask::${ZONE_NAME:?export DockerRegistry-ZoneName introuvable dans cette region}"
+
+      - name: Valider le template
+        run: sam validate --lint --template-file template.yaml
+
+      # Une pile dont la toute premiere creation a echoue reste en ROLLBACK_COMPLETE
+      # et ne peut plus etre mise a jour : elle est vide, on la supprime avant de reessayer.
+      - name: Supprimer une pile de pull request restee en echec de creation
+        if: github.event_name == 'pull_request'
+        run: if [ "$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].StackStatus" --output text 2>/dev/null)" = "ROLLBACK_COMPLETE" ]; then aws cloudformation delete-stack --stack-name "$STACK_NAME" && aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"; fi
+
+      # SubDomain n'est passe que s'il est non vide (pile principale sans REGISTRY_SUBDOMAIN).
+      - name: Deployer la pile
+        run: sam deploy --template-file template.yaml --stack-name "$STACK_NAME" --s3-bucket "$SAM_ASSETS_BUCKET" --s3-prefix "$STACK_NAME" --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset --parameter-overrides "GitHubOwner=$GITHUB_REPOSITORY_OWNER" "GitHubOwnerId=$GITHUB_REPOSITORY_OWNER_ID" "RepositoryPrefix=$REPOSITORY_PREFIX" ${SUBDOMAIN:+"SubDomain=$SUBDOMAIN"}

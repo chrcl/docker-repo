@@ -1,0 +1,48 @@
+# Supprime la pile de test <STACK_NAME>-pr<numero> a la fermeture d'une pull request,
+# qu'elle soit fusionnee ou simplement fermee.
+#
+# Secret et variables sont ceux de l'environnement GitHub "prod", pas du depot.
+#
+# Secret :    AWS_DELETE_ROLE_ARN  role cree par template-role.yaml (sortie DeleteRoleArn)
+# Variables : AWS_REGION, STACK_NAME (les memes que deploy.yml)
+#
+# Ne sont pas supprimes, car ils ne font pas partie de la pile : les depots ECR
+# gh-pr<numero>/* crees par un push de test et les parametres SSM
+# /<STACK_NAME>-pr<numero>/tokens/* crees a la main.
+name: Suppression de la pile de pull request
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  id-token: write
+  contents: read
+
+# Meme groupe que deploy.yml : la suppression attend la fin d'un deploiement en cours.
+concurrency:
+  group: stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  delete:
+    # Les pull requests venant d'un fork ne sont jamais deployees.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      STACK_NAME: ${{ format('{0}-pr{1}', vars.STACK_NAME, github.event.pull_request.number) }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DELETE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          # Masque le numero de compte AWS dans les journaux (publics si le depot l'est).
+          mask-aws-account-id: true
+
+      # Sans effet si la pile n'existe pas (pull request qui ne touchait pas au template).
+      - name: Supprimer la pile
+        run: aws cloudformation delete-stack --stack-name "$STACK_NAME"
+
+      - name: Attendre la fin de la suppression
+        run: aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
