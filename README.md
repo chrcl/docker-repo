@@ -154,7 +154,7 @@ Une valeur masquée apparaît `***` partout dans le journal, y compris à l'int�
 Deux limites :
 
 - Les sorties de la pile ne sont plus affichées par le workflow : les lire avec la commande `aws cloudformation describe-stacks` de la section « Déploiement manuel ».
-- Le masquage ne couvre que les workflows de ce dépôt. Un dépôt de projet public qui pousse des images doit garder `mask-aws-account-id: true` (déjà présent dans `examples/github-workflow.yml`).
+- Le masquage ne couvre que les workflows de ce dépôt. Un dépôt de projet public qui pousse des images doit garder `mask-aws-account-id: true` (déjà présent dans `skills/docker-registry/assets/push-workflow.yml`).
 
 Points à connaître sur l'environnement :
 
@@ -238,7 +238,7 @@ Le registre accueille plusieurs projets : un dépôt ECR `gh/<projet>` par dép�
 
 **Nouveau projet (push).** Rien à déclarer côté AWS :
 
-1. Copier `examples/github-workflow.yml` dans `.github/workflows/` du dépôt GitHub et y régler `IMAGE_NAME` sur `gh/<projet>`.
+1. Copier `skills/docker-registry/assets/push-workflow.yml` dans `.github/workflows/` du dépôt GitHub et y régler `IMAGE_NAME` sur `gh/<projet>`.
 2. Créer dans ce dépôt l'environnement GitHub `prod` avec les variables `AWS_REGION` et `ECR_PUSH_ROLE_ARN` (sortie `GitHubPushRoleArn` de la pile) :
 
 ```
@@ -259,6 +259,24 @@ Deux usages typiques :
 
 - un client pour vous-même, sans restriction, qui tire toutes les images ;
 - un client par consommateur externe, limité à un projet avec la valeur `"TOKEN gh/<projet>"`.
+
+## Skill pour agents IA
+
+Le dossier `skills/docker-registry/` est un skill au format [Agent Skills](https://agentskills.io/specification), installable avec la CLI de [skills.sh](https://skills.sh). Il apprend à un agent (Claude Code, Codex, Cursor, Copilot, Gemini CLI...) à utiliser et administrer ce registre : lire la configuration de la pile, tirer une image, créer, renouveler ou révoquer un token, préparer un dépôt GitHub pour pousser, lister ou supprimer des images, diagnostiquer une erreur.
+
+Installer le skill dans un projet, pour tous les agents compatibles :
+
+```
+npx skills add chrcl/docker-repo --skill docker-registry
+```
+
+Pour un agent précis, par exemple Claude Code :
+
+```
+npx skills add chrcl/docker-repo --skill docker-registry -a claude-code
+```
+
+Le skill ne contient ni numéro de compte, ni domaine, ni token : l'agent lit ces valeurs dans les sorties de la pile, avec les identifiants AWS de la personne qui l'utilise. Pour tirer une image, il lui faut seulement l'hôte du registre, un utilisateur et un token.
 
 ## Gérer les tokens de pull
 
@@ -319,7 +337,7 @@ Le proxy est en lecture seule : tout push par ce chemin est refusé.
 
 ## Pousser depuis GitHub Actions
 
-Copier `examples/github-workflow.yml` dans `.github/workflows/` du dépôt qui construit l'image, puis créer son environnement GitHub `prod` avec les variables `AWS_REGION` et `ECR_PUSH_ROLE_ARN` (commandes dans « Déclarer un projet et un client »).
+Copier `skills/docker-registry/assets/push-workflow.yml` dans `.github/workflows/` du dépôt qui construit l'image, puis créer son environnement GitHub `prod` avec les variables `AWS_REGION` et `ECR_PUSH_ROLE_ARN` (commandes dans « Déclarer un projet et un client »).
 
 Le dépôt ECR `gh/<nom>` est créé automatiquement au premier push, avec les règles de rétention de la pile. Le nom doit être en minuscules. Les règles de rétention ne s'appliquent qu'aux dépôts créés après le déploiement : modifier les paramètres de la pile ne change pas les dépôts existants.
 
@@ -360,7 +378,7 @@ Constaté sur AWS : la chaîne CloudFront + URL de fonction Lambda annonce `Cont
 
 Non vérifié :
 
-- le push depuis GitHub Actions avec le rôle de push et `examples/github-workflow.yml` ;
+- le push depuis GitHub Actions avec le rôle de push et `skills/docker-registry/assets/push-workflow.yml` ;
 - le workflow `cleanup-pr.yml`, qui ne s'exécute qu'à la fermeture d'une pull request.
 
 Contrôles à faire après un déploiement :
