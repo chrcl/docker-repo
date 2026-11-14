@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Registre Docker prive sur ECR. Push depuis GitHub Actions via OIDC (aucune cle AWS
+  stockee dans GitHub). Pull par les consommateurs avec un simple "docker login"
+  utilisateur + token, sans aucun identifiant AWS.
+
+Metadata:
+  cfn-lint:
+    config:
+      # W6001 deconseille de recopier un import dans une sortie. La sortie RegistryHost
+      # compose volontairement le nom du registre a partir de la zone importee.
+      ignore_checks: [W6001]
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Depots ECR}
+        Parameters: [RepositoryPrefix, ImageTagMutability, UntaggedRetentionDays, MaxImagesPerRepository]
+      - Label: {default: Push depuis GitHub Actions}
+        Parameters: [GitHubOwner, GitHubOwnerId, GitHubRepo]
+      - Label: {default: Pull par token}
+        Parameters: [TokenCacheSeconds, SubDomain]
+
+Parameters:
+  RepositoryPrefix:
+    Type: String
+    Default: gh
+    AllowedPattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+    Description: >-
+      Prefixe des depots ECR. Tout push vers <prefixe>/<nom> cree le depot
+      automatiquement. Le proxy de pull et le role GitHub sont limites a ce prefixe.
+  ImageTagMutability:
+    Type: String
+    Default: MUTABLE
+    AllowedValues: [MUTABLE, IMMUTABLE]
+    Description: IMMUTABLE interdit de repousser un tag existant (latest compris).
+  UntaggedRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Les images sans tag sont supprimees apres ce nombre de jours.
+  MaxImagesPerRepository:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Nombre maximal d'images conservees par depot (les plus anciennes sont supprimees).
+  GitHubOwner:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$'
+    Description: Compte ou organisation GitHub dont les workflows peuvent pousser des images.
+  GitHubOwnerId:
+    Type: String
+    Default: '*'
+    AllowedPattern: '^(\*|[0-9]+)$'
+    Description: >-
+      Identifiant numerique du compte GitHub (champ "id" de
+      https://api.github.com/users/<compte>). Utilise pour les depots dont le jeton
+      OIDC a le nouveau format repo:<compte>@<id>/<depot>@<id>. "*" accepte tout id.
+  GitHubRepo:
+    Type: String
+    Default: '*'
+    AllowedPattern: '^[A-Za-z0-9._*-]+$'
+    Description: Depot GitHub autorise a pousser ("*" = tous les depots du compte).
+  TokenCacheSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 900
+    Description: Duree de cache des tokens dans le proxy. C'est aussi le delai maximal de prise en compte d'une revocation.
+  SubDomain:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)?$'
+    Description: >-
+      Etiquette DNS du registre dans la zone exportee par template-account.yaml : le
+      registre repond sur <SubDomain>.<zone>. Vide : il repond sur le nom de la zone
+      lui-meme. Le certificat exporte doit couvrir le nom obtenu.
+
+Conditions:
+  HasSubDomain: !Not [!Equals [!Ref SubDomain, '']]
+
+Resources:
+  # ---------------------------------------------------------------- Depots ECR
+  # Pas de depot declare ici : ECR cree <prefixe>/<nom> au premier push et lui
+  # applique ce modele. Le modele ne s'applique qu'a la creation d'un depot.
+  RepositoryTemplate:
+    Type: AWS::ECR::RepositoryCreationTemplate
+    Properties:
+      Prefix: !Ref RepositoryPrefix
+      AppliedFor: [CREATE_ON_PUSH]
+      Description: !Sub 'Depots crees au premier push (pile ${AWS::StackName})'
+      ImageTagMutability: !Ref ImageTagMutability
+      LifecyclePolicy: !Sub |
+        {
+          "rules": [
+            {
+              "rulePriority": 1,
+              "description": "Supprime les images sans tag",
+              "selection": {
+                "tagStatus": "untagged",
+                "countType": "sinceImagePushed",
+                "countUnit": "days",
+                "countNumber": ${UntaggedRetentionDays}
+              },
+              "action": {"type": "expire"}
+            },
+            {
+              "rulePriority": 2,
+              "description": "Ne garde que les images les plus recentes",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": ${MaxImagesPerRepository}
+              },
+              "action": {"type": "expire"}
+            }
+          ]
+        }
+
+  # ------------------------------------------- Push depuis GitHub Actions (OIDC)
+  # Le fournisseur OIDC token.actions.githubusercontent.com doit deja exister dans
+  # le compte AWS : il n'est cree par aucun template de ce depot.
+  GitHubPushRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Push des images GitHub Actions vers ECR (${RepositoryPrefix}/*)'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                # Ancien format (depots existants) puis nouveau format avec
+                # identifiants immuables (depots crees apres le 15/07/2026).
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*'
+                  - !Sub 'repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@*:*'
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryPrefix}/*'
+
+  # ------------------------------------------------------ Pull par token (proxy)
+  # Client Docker -> CloudFront -> URL de fonction Lambda -> ECR.
+  # La Lambda ne transporte que les manifestes ; pour les couches, ECR repond par
+  # une redirection vers une URL S3 pre-signee que le client telecharge en direct.
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 30
+
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal: {Service: lambda.amazonaws.com}
+      Policies:
+        - PolicyName: registry-pull-proxy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProxyLogGroup.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryPrefix}/*'
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/tokens/*'
+
+  # Le code est en ligne pour que la pile se deploie en une commande, sans bucket S3.
+  # Il doit rester court (limite CloudFormation du code en ligne) : tests/local_e2e.py
+  # verifie sa taille et son comportement.
+  #
+  # Un token = un parametre SSM SecureString /<pile>/tokens/<utilisateur> dont la
+  # valeur est "<token>" ou "<token> <motif>[,<motif>...]" pour limiter les depots.
+  #
+  # Requetes HEAD sur un manifeste : la chaine CloudFront + URL de fonction annonce
+  # Content-Length: 0 sur toute reponse a un HEAD (constate en production), ce que
+  # containerd prend pour la taille du manifeste. La fonction repond donc 405 : pour ce
+  # cas, containerd refait la meme requete en GET, qui porte la vraie taille.
+  ProxyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Proxy de pull Docker (authentification par token) vers ECR
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 29
+      Role: !GetAtt ProxyRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProxyLogGroup
+      Environment:
+        Variables:
+          ECR_HOST: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}'
+          TOKEN_PATH: !Sub '/${AWS::StackName}/tokens/'
+          CACHE_TTL: !Ref TokenCacheSeconds
+      Code:
+        ZipFile: |
+          import base64, fnmatch, hmac, http.client, json, os, re, time
+          import boto3
+
+          HOST = os.environ["ECR_HOST"]
+          TOKEN_PATH = os.environ["TOKEN_PATH"]
+          TTL = int(os.environ["CACHE_TTL"])
+          MAX = 4_000_000
+          PATH = re.compile(r"/v2/(?:([a-z0-9._/-]+)/(manifests|blobs|tags|referrers)/[A-Za-z0-9_.:-]+)?")
+          USER = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+          KEEP = {"content-type", "docker-content-digest", "etag", "link", "location", "oci-subject"}
+          ecr = boto3.client("ecr")
+          ssm = boto3.client("ssm")
+          users = {}
+          up = {"exp": 0}
+
+
+          def reply(status, body=b"", headers=None):
+              return {"statusCode": status, "isBase64Encoded": True, "body": base64.b64encode(body).decode(),
+                      "headers": {"docker-distribution-api-version": "registry/2.0", **(headers or {})}}
+
+
+          def error(status, code, message, extra=None):
+              body = json.dumps({"errors": [{"code": code, "message": message}]}).encode()
+              return reply(status, body, {"content-type": "application/json", **(extra or {})})
+
+
+          def secret(user):
+              hit = users.get(user)
+              if not hit or hit[0] < time.time():
+                  if len(users) > 500:
+                      users.clear()
+                  try:
+                      value = ssm.get_parameter(Name=TOKEN_PATH + user, WithDecryption=True)["Parameter"]["Value"]
+                  except ssm.exceptions.ParameterNotFound:
+                      value = ""
+                  hit = users[user] = (time.time() + TTL, value.split())
+              return hit[1]
+
+
+          def scopes(header):
+              try:
+                  user, _, token = base64.b64decode(header.split()[1]).decode().partition(":")
+              except Exception:
+                  return None
+              stored = secret(user) if USER.fullmatch(user) else None
+              if not stored or not hmac.compare_digest(stored[0].encode(), token.encode()):
+                  return None
+              return stored[1].split(",") if len(stored) > 1 else ["*"]
+
+
+          def upstream(method, path, accept):
+              if up["exp"] < time.time():
+                  data = ecr.get_authorization_token()["authorizationData"][0]
+                  up.update(token=data["authorizationToken"], exp=data["expiresAt"].timestamp() - 900)
+              headers = {"Authorization": "Basic " + up["token"]}
+              if accept:
+                  headers["Accept"] = accept
+              conn = http.client.HTTPSConnection(HOST, timeout=20)
+              try:
+                  conn.request(method, path, headers=headers)
+                  res = conn.getresponse()
+                  return res.status, res.getheaders(), res.read(MAX + 1)
+              finally:
+                  conn.close()
+
+
+          def handler(event, _context):
+              method = event["requestContext"]["http"]["method"]
+              headers = event.get("headers") or {}
+              match = PATH.fullmatch(event["rawPath"])
+              if method not in ("GET", "HEAD") or not match:
+                  return error(404, "UNSUPPORTED", "unsupported request")
+              allowed = scopes(headers.get("x-registry-auth", ""))
+              if allowed is None:
+                  return error(401, "UNAUTHORIZED", "invalid credentials")
+              repo = match.group(1)
+              if not repo:
+                  return reply(200, b"{}", {"content-type": "application/json"})
+              if not any(fnmatch.fnmatchcase(repo, glob) for glob in allowed):
+                  return error(403, "DENIED", "token not allowed for this repository")
+              if method == "HEAD" and match.group(2) == "manifests":
+                  return error(405, "UNSUPPORTED", "use GET for manifests", {"allow": "GET"})
+              query = event.get("rawQueryString")
+              status, raw, body = upstream(method, event["rawPath"] + ("?" + query if query else ""), headers.get("accept"))
+              if status == 401:
+                  up["exp"] = 0
+              if status == 401 or len(body) > MAX:
+                  return error(502, "UNKNOWN", "registry backend error")
+              return reply(status, body, {k.lower(): v for k, v in raw if k.lower() in KEEP})
+
+  # URL publique : l'authentification est faite par la fonction elle-meme (token).
+  ProxyUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ProxyFunction.Arn
+      AuthType: NONE
+
+  ProxyUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  ProxyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  # Docker n'envoie ses identifiants qu'apres un 401 portant WWW-Authenticate. Une
+  # URL de fonction Lambda renomme cet en-tete (x-amzn-Remapped-...), donc le defi
+  # est emis ici, en bordure CloudFront. Les identifiants sont ensuite transmis a la
+  # Lambda dans X-Registry-Auth, CloudFront ne relayant pas Authorization par defaut.
+  ChallengeFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-${AWS::Region}-challenge'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Defi Basic du registre Docker
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var auth = request.headers.authorization;
+          if (!auth || auth.value.slice(0, 6).toLowerCase() !== 'basic ') {
+            return {
+              statusCode: 401,
+              statusDescription: 'Unauthorized',
+              headers: {
+                'www-authenticate': { value: 'Basic realm="docker-registry"' },
+                'docker-distribution-api-version': { value: 'registry/2.0' }
+              }
+            };
+          }
+          request.headers['x-registry-auth'] = { value: auth.value };
+          return request;
+        }
+
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${AWS::StackName}-${AWS::Region}-registry'
+        Comment: En-tetes transmis au proxy de registre
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: [Accept, X-Registry-Auth]
+        CookiesConfig:
+          CookieBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: [ProxyUrlPermission, ProxyInvokePermission]
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} - registre Docker (pull par token)'
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        # Nom de domaine, zone et certificat viennent des exports de template-account.yaml.
+        Aliases:
+          - !Join ['', [!If [HasSubDomain, !Sub '${SubDomain}.', ''], !ImportValue DockerRegistry-ZoneName]]
+        ViewerCertificate:
+          AcmCertificateArn: !ImportValue DockerRegistry-CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: proxy
+            DomainName: !Select [2, !Split ['/', !GetAtt ProxyUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: proxy
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          # Politique geree "CachingDisabled" : rien n'est mis en cache.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: !Ref OriginRequestPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt ChallengeFunction.FunctionMetadata.FunctionARN
+
+  # Enregistrements alias du nom de domaine vers la distribution. Z2FDTNDATAQYW2 est
+  # l'identifiant de zone fixe de CloudFront, le meme pour toutes les distributions.
+  DnsRecordIpv4:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue DockerRegistry-HostedZoneId
+      Name: !Join ['', [!If [HasSubDomain, !Sub '${SubDomain}.', ''], !ImportValue DockerRegistry-ZoneName]]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  DnsRecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue DockerRegistry-HostedZoneId
+      Name: !Join ['', [!If [HasSubDomain, !Sub '${SubDomain}.', ''], !ImportValue DockerRegistry-ZoneName]]
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  RegistryHost:
+    Description: Hote a utiliser pour docker login / docker pull.
+    Value: !Join ['', [!If [HasSubDomain, !Sub '${SubDomain}.', ''], !ImportValue DockerRegistry-ZoneName]]
+  EcrRegistry:
+    Description: Registre ECR vers lequel GitHub Actions pousse les images.
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}'
+  RepositoryPrefix:
+    Description: Prefixe obligatoire des noms d'images.
+    Value: !Ref RepositoryPrefix
+  GitHubPushRoleArn:
+    Description: Role a assumer depuis GitHub Actions (role-to-assume).
+    Value: !GetAtt GitHubPushRole.Arn
+  TokenParameterPath:
+    Description: Chemin SSM sous lequel creer un parametre SecureString par consommateur.
+    Value: !Sub '/${AWS::StackName}/tokens/'

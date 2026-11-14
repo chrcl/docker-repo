@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Roles IAM assumes par GitHub Actions (OIDC) : deploiement de la pile du registre
+  Docker (template.yaml) et de ses copies de test par pull request, et suppression
+  des piles de pull request. A deployer une fois, a la main, par un administrateur.
+
+# Prerequis, dans le compte : le fournisseur OIDC token.actions.githubusercontent.com,
+# le bucket S3 des artefacts, et la pile template-account.yaml deployee dans la meme
+# region (cette pile importe l'identifiant de la zone Route 53 qu'elle exporte).
+#
+# Ne pas donner a CETTE pile un nom commencant par "<StackName>-" : les roles crees ici
+# porteraient un nom couvert par leurs propres droits IAM et pourraient se modifier.
+#
+# Les piles de pull request s'appellent <StackName>-pr<numero>. Ne nommer aucune autre
+# pile "<StackName>-pr..." : elle serait couverte par les droits des deux roles.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$'
+    Description: Compte ou organisation GitHub proprietaire du depot qui deploie.
+  GitHubRepo:
+    Type: String
+    Default: docker-repo
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+    Description: Depot GitHub dont le workflow deploie la pile.
+  GitHubEnvironment:
+    Type: String
+    Default: prod
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+    Description: >-
+      Environnement GitHub dont les jobs peuvent assumer les roles. Un job qui declare
+      un environnement presente a AWS le sujet repo:<compte>/<depot>:environment:<nom>,
+      quelle que soit la branche ou la pull request qui l'a declenche.
+  GitHubOwnerId:
+    Type: String
+    Default: '*'
+    AllowedPattern: '^(\*|[0-9]+)$'
+    Description: >-
+      Identifiant numerique du compte GitHub, pour le format de jeton OIDC
+      repo:<compte>@<id>/<depot>@<id>. "*" accepte tout id.
+  GitHubRepoId:
+    Type: String
+    Default: '*'
+    AllowedPattern: '^(\*|[0-9]+)$'
+    Description: Identifiant numerique du depot GitHub, meme usage. "*" accepte tout id.
+  StackName:
+    Type: String
+    Default: docker-repo
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{0,19}$'
+    Description: >-
+      Nom de la pile principale (variable STACK_NAME des workflows). 20 caracteres au
+      plus, pour que les noms generes des ressources contiennent en entier le nom des
+      piles de pull request.
+  AssetsBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Bucket S3 existant ou le template est televerse (variable SAM_ASSETS_BUCKET).
+
+Resources:
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Deploiement des piles ${StackName} et ${StackName}-pr* par GitHub Actions (${GitHubOwner}/${GitHubRepo})'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                # Jobs de l'environnement GitHub, dans l'ancien format du sujet puis
+                # dans le format avec identifiants immuables.
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}'
+                  - !Sub 'repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${GitHubEnvironment}'
+      Policies:
+        # Les listes d'actions par type de ressource viennent des schemas du registre
+        # CloudFormation (section "handlers"), limitees aux fonctions utilisees par la pile.
+        - PolicyName: deploy-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StackOperations
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}-pr*/*'
+              # Une pile de pull request dont la premiere creation a echoue doit etre
+              # supprimee avant un nouvel essai. Jamais la pile principale.
+              - Sid: DeleteFailedPullRequestStack
+                Effect: Allow
+                Action: cloudformation:DeleteStack
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}-pr*/*'
+              # Lecture des exports de template-account.yaml importes par la pile.
+              - Sid: AccountExportsRead
+                Effect: Allow
+                Action: cloudformation:ListExports
+                Resource: '*'
+              - Sid: TemplateUpload
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/*'
+              - Sid: TemplateBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}'
+              # AWS::ECR::RepositoryCreationTemplate : actions au niveau du registre,
+              # sans restriction possible par ressource.
+              - Sid: EcrCreationTemplate
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepositoryCreationTemplate
+                  - ecr:UpdateRepositoryCreationTemplate
+                  - ecr:DeleteRepositoryCreationTemplate
+                  - ecr:DescribeRepositoryCreationTemplates
+                  - ecr:CreateRepository
+                  - ecr:PutLifecyclePolicy
+                Resource: '*'
+              - Sid: EcrTemplateServiceLinkedRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*/AWSServiceRoleForECRTemplate*'
+              # AWS::IAM::Role : uniquement les roles nommes par la pile (<pile>-...).
+              - Sid: StackRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackName}-*'
+              - Sid: PassProxyRoleToLambda
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackName}-*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': lambda.amazonaws.com
+              # AWS::Logs::LogGroup
+              - Sid: StackLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:PutLogGroupDeletionProtection
+                  - logs:GetDataProtectionPolicy
+                  - logs:DescribeIndexPolicies
+                  - logs:ListTagsForResource
+                  - logs:TagResource
+                  - logs:UntagResource
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${StackName}-*'
+              - Sid: LogsRead
+                Effect: Allow
+                Action: [logs:DescribeLogGroups, logs:DescribeResourcePolicies]
+                Resource: '*'
+              # AWS::Lambda::Function, AWS::Lambda::Url, AWS::Lambda::Permission
+              - Sid: StackFunction
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionCodeSigningConfig
+                  - lambda:GetFunctionRecursionConfig
+                  - lambda:GetFunctionScalingConfig
+                  - lambda:GetRuntimeManagementConfig
+                  - lambda:PutFunctionRecursionConfig
+                  - lambda:PutRuntimeManagementConfig
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:CreateFunctionUrlConfig
+                  - lambda:UpdateFunctionUrlConfig
+                  - lambda:DeleteFunctionUrlConfig
+                  - lambda:GetFunctionUrlConfig
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackName}-*'
+              - Sid: FunctionNetworkRead
+                Effect: Allow
+                Action: ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              # AWS::Route53::RecordSet : enregistrements DNS du registre dans sa zone.
+              - Sid: RegistryDnsRecords
+                Effect: Allow
+                Action: [route53:ChangeResourceRecordSets, route53:ListResourceRecordSets, route53:GetHostedZone]
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:route53:::hostedzone/${ZoneId}'
+                  - ZoneId: !ImportValue DockerRegistry-HostedZoneId
+              - Sid: DnsRead
+                Effect: Allow
+                Action: [route53:GetChange, route53:ListHostedZones]
+                Resource: '*'
+              # Lecture du certificat ACM associe a la distribution.
+              - Sid: CertificateRead
+                Effect: Allow
+                Action: [acm:DescribeCertificate, acm:ListCertificates]
+                Resource: '*'
+              # AWS::CloudFront::Distribution, ::Function, ::OriginRequestPolicy : les
+              # identifiants sont generes par CloudFront, donc pas de restriction a la pile.
+              - Sid: CloudFront
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateDistribution
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:CreateFunction
+                  - cloudfront:UpdateFunction
+                  - cloudfront:PublishFunction
+                  - cloudfront:DeleteFunction
+                  - cloudfront:DescribeFunction
+                  - cloudfront:GetFunction
+                  - cloudfront:CreateOriginRequestPolicy
+                  - cloudfront:UpdateOriginRequestPolicy
+                  - cloudfront:DeleteOriginRequestPolicy
+                  - cloudfront:GetOriginRequestPolicy
+                  - cloudfront:ListTagsForResource
+                  - cloudfront:TagResource
+                  - cloudfront:UntagResource
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:*'
+
+  # Suppression des piles de pull request uniquement (<StackName>-pr<numero>), a la
+  # fermeture de la pull request. Ce role ne peut ni creer ni modifier de ressource,
+  # a l'exception de la desactivation d'une distribution CloudFront avant suppression.
+  DeleteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Suppression des piles ${StackName}-pr* par GitHub Actions (${GitHubOwner}/${GitHubRepo})'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}'
+                  - !Sub 'repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${GitHubEnvironment}'
+      Policies:
+        # Actions des handlers "delete" et "read" des schemas du registre CloudFormation.
+        - PolicyName: delete-pull-request-stacks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StackDeletion
+                Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}-pr*/*'
+              - Sid: EcrCreationTemplate
+                Effect: Allow
+                Action:
+                  - ecr:DeleteRepositoryCreationTemplate
+                  - ecr:DescribeRepositoryCreationTemplates
+                Resource: '*'
+              - Sid: StackRoles
+                Effect: Allow
+                Action:
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackName}-pr*'
+              - Sid: StackLogGroup
+                Effect: Allow
+                Action:
+                  - logs:DeleteLogGroup
+                  - logs:GetDataProtectionPolicy
+                  - logs:DescribeIndexPolicies
+                  - logs:ListTagsForResource
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${StackName}-pr*'
+              - Sid: LogsRead
+                Effect: Allow
+                Action: [logs:DescribeLogGroups, logs:DescribeResourcePolicies]
+                Resource: '*'
+              - Sid: StackFunction
+                Effect: Allow
+                Action:
+                  - lambda:DeleteFunction
+                  - lambda:DeleteFunctionUrlConfig
+                  - lambda:RemovePermission
+                  - lambda:GetFunction
+                  - lambda:GetFunctionCodeSigningConfig
+                  - lambda:GetFunctionRecursionConfig
+                  - lambda:GetFunctionScalingConfig
+                  - lambda:GetRuntimeManagementConfig
+                  - lambda:GetFunctionUrlConfig
+                  - lambda:GetPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackName}-pr*'
+              - Sid: FunctionNetworkRead
+                Effect: Allow
+                Action: ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              # AWS::Route53::RecordSet : enregistrements DNS du registre dans sa zone.
+              - Sid: RegistryDnsRecords
+                Effect: Allow
+                Action: [route53:ChangeResourceRecordSets, route53:ListResourceRecordSets, route53:GetHostedZone]
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:route53:::hostedzone/${ZoneId}'
+                  - ZoneId: !ImportValue DockerRegistry-HostedZoneId
+              - Sid: DnsRead
+                Effect: Allow
+                Action: [route53:GetChange, route53:ListHostedZones]
+                Resource: '*'
+              # Identifiants generes par CloudFront : pas de restriction possible aux
+              # seules ressources des piles de pull request. UpdateDistribution sert a
+              # desactiver la distribution, prealable a sa suppression.
+              - Sid: CloudFront
+                Effect: Allow
+                Action:
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:DeleteFunction
+                  - cloudfront:DescribeFunction
+                  - cloudfront:GetFunction
+                  - cloudfront:DeleteOriginRequestPolicy
+                  - cloudfront:GetOriginRequestPolicy
+                  - cloudfront:ListTagsForResource
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:*'
+
+Outputs:
+  DeployRoleArn:
+    Description: Valeur du secret GitHub AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt DeployRole.Arn
+  DeleteRoleArn:
+    Description: Valeur du secret GitHub AWS_DELETE_ROLE_ARN.
+    Value: !GetAtt DeleteRole.Arn

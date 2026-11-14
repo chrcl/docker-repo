@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Parametres du compte AWS pour le registre Docker : zone Route 53 et certificat TLS
+  existants, exportes pour etre lus par template.yaml et template-role.yaml
+  (Fn::ImportValue). Cette pile ne cree aucune ressource AWS.
+
+# A deployer une fois, a la main, dans la MEME region que le registre : un export
+# CloudFormation n'est visible que dans sa region.
+#
+# Prerequis, crees en dehors de ce depot :
+#   - la zone Route 53 du domaine ;
+#   - un certificat ACM valide, dans la region us-east-1 (exigence de CloudFront),
+#     couvrant les noms du registre : voir le parametre SubDomain de template.yaml ;
+#   - le fournisseur OIDC token.actions.githubusercontent.com du compte.
+#
+# Un export utilise par une autre pile ne peut etre ni modifie ni supprime : pour
+# changer une valeur, il faut d'abord supprimer les piles qui l'importent.
+
+Parameters:
+  ZoneName:
+    Type: String
+    AllowedPattern: '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
+    Description: Nom de la zone Route 53, sans point final, ex. docker.example.com.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Identifiant de cette zone Route 53.
+  CertificateArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/[A-Za-z0-9-]+$'
+    ConstraintDescription: doit etre l'ARN d'un certificat ACM de la region us-east-1.
+    Description: ARN du certificat ACM (region us-east-1) couvrant les noms du registre.
+
+Resources:
+  # Un modele CloudFormation doit declarer au moins une ressource. Celle-ci ne cree
+  # rien dans le compte et ne coute rien.
+  Placeholder:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+Outputs:
+  ZoneName:
+    Description: Nom de la zone Route 53 du registre.
+    Value: !Ref ZoneName
+    Export:
+      Name: DockerRegistry-ZoneName
+  HostedZoneId:
+    Description: Identifiant de la zone Route 53 du registre.
+    Value: !Ref HostedZoneId
+    Export:
+      Name: DockerRegistry-HostedZoneId
+  CertificateArn:
+    Description: Certificat ACM utilise par les distributions CloudFront du registre.
+    Value: !Ref CertificateArn
+    Export:
+      Name: DockerRegistry-CertificateArn
