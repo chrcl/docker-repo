@@ -1,12 +1,12 @@
-# A copier dans .github/workflows/ du depot qui construit l'image.
+# Copy to .github/workflows/ in the repository that builds the image.
 #
-# Variables a definir dans l'environnement GitHub "prod" de ce depot :
-#   AWS_REGION          region de la pile, ex. eu-west-3
-#   ECR_PUSH_ROLE_ARN   sortie GitHubPushRoleArn de la pile
+# Variables to define in the "prod" GitHub environment of that repository:
+#   AWS_REGION          region of the registry stack, e.g. us-east-1
+#   ECR_PUSH_ROLE_ARN   GitHubPushRoleArn output of the registry stack
 #
-# Aucune cle AWS n'est stockee dans GitHub : le workflow echange son jeton OIDC
-# contre des identifiants temporaires (1 h) limites au push dans gh/*.
-name: Build et push de l'image vers ECR
+# No AWS key is stored in GitHub: the job exchanges its OIDC token for temporary
+# credentials (1 h) that can only push to the registry repository prefix.
+name: Build and push the image to ECR
 
 on:
   push:
@@ -17,8 +17,8 @@ permissions:
   contents: read
 
 env:
-  # Nom du depot ECR : prefixe de la pile + nom en minuscules (ECR refuse les majuscules).
-  IMAGE_NAME: gh/mon-image
+  # ECR repository: registry prefix (RepositoryPrefix output) + lowercase name.
+  IMAGE_NAME: gh/my-image
 
 jobs:
   build:
@@ -31,8 +31,8 @@ jobs:
         with:
           role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-          # Masque le numero de compte AWS dans les journaux, y compris dans l'adresse
-          # du registre ECR affichee lors du build.
+          # Masks the AWS account ID in the logs, including in the ECR registry
+          # address printed during the build.
           mask-aws-account-id: true
 
       - id: ecr
